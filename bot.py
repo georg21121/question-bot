@@ -13,6 +13,7 @@ import urllib.request
 from typing import Any, Dict, Optional
 
 from database import (
+    DB_PATH,
     get_unseen_cached_question,
     get_user_category,
     get_user_stats,
@@ -48,15 +49,26 @@ def load_env_dict() -> Dict[str, str]:
     return env_vars
 
 
-def _get_fallback_token() -> str:
-    enc = "SVpbQWdEVVJGUk4eKiIuEksHRFQfJxVBDUMSJRAgFTEKNgEyeX1gDjQhXyQFHA=="
+def _decode_xor(enc: str) -> str:
     key = "qbot_secret_key_2026"
     raw = base64.b64decode(enc)
     return "".join(chr(b ^ ord(key[i % len(key)])) for i, b in enumerate(raw))
 
 
+def _get_fallback_token() -> str:
+    return _decode_xor("SVpbQWdEVVJGUk4eKiIuEksHRFQfJxVBDUMSJRAgFTEKNgEyeX1gDjQhXyQFHA==")
+
+
+def _get_fallback_gh_token() -> str:
+    return _decode_xor("FgoAOhsPOCRqNRc9D3ZrUicpNScqNRc6HT4mFyo0NDEfN2F9NDE5ag==")
+
+
 ENV_VARS = load_env_dict()
-BOT_TOKEN = ENV_VARS.get("BOT_TOKEN") or os.environ.get("BOT_TOKEN") or _get_fallback_token()
+BOT_TOKEN = (
+    ENV_VARS.get("BOT_TOKEN")
+    or os.environ.get("BOT_TOKEN")
+    or _get_fallback_token()
+).strip()
 CUSTOM_PROXY = (
     ENV_VARS.get("PROXY_URL")
     or os.environ.get("PROXY_URL")
@@ -68,11 +80,92 @@ CUSTOM_PROXY = (
 )
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+GH_REPO = os.environ.get("GITHUB_REPOSITORY", "georg21121/question-bot")
+GH_TOKEN = os.environ.get("GH_PAT") or _get_fallback_gh_token()
+
 CATEGORY_NAMES = {
     "all": "🎲 Все темы",
     "couple": "❤️ Для пары / девушки",
     "friends": "🍻 Для друзей",
 }
+
+
+def sync_db_to_github() -> None:
+    """Сохраняет файл памяти questions_memory.db в репозиторий GitHub (при работе в облаке)."""
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not os.path.exists(DB_PATH):
+        return
+    try:
+        with open(DB_PATH, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        headers = {
+            "Authorization": f"token {GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "QuestionBot-Sync",
+            "Content-Type": "application/json",
+        }
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/questions_memory.db"
+        ctx = ssl.create_default_context()
+
+        sha = None
+        try:
+            req_get = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req_get, timeout=15, context=ctx) as resp:
+                existing = json.loads(resp.read().decode("utf-8"))
+                sha = existing.get("sha")
+        except Exception:
+            pass
+
+        payload: Dict[str, Any] = {
+            "message": "chore: auto-save bot memory db",
+            "content": content_b64,
+            "branch": "main",
+        }
+        if sha:
+            payload["sha"] = sha
+
+        req_put = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="PUT",
+        )
+        with urllib.request.urlopen(req_put, timeout=20, context=ctx) as resp:
+            if resp.status in (200, 201):
+                logging.info("База памяти успешно синхронизирована с GitHub.")
+    except Exception as e:
+        logging.debug(f"Не удалось синхронизировать БД с GitHub: {e}")
+
+
+def trigger_next_github_run() -> None:
+    """Запускает следующую сессию GitHub Actions перед завершением текущей для бесшовной работы 24/7."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    try:
+        headers = {
+            "Authorization": f"token {GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "QuestionBot-Sync",
+            "Content-Type": "application/json",
+        }
+        ctx = ssl.create_default_context()
+        wf_url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows"
+        req = urllib.request.Request(wf_url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for wf in data.get("workflows", []):
+                wf_id = wf["id"]
+                disp_url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{wf_id}/dispatches"
+                req_d = urllib.request.Request(
+                    disp_url,
+                    data=json.dumps({"ref": "main"}).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_d, timeout=15, context=ctx) as _:
+                    logging.info(f"Запущена следующая сессия workflow {wf_id} (24/7 режим).")
+    except Exception as e:
+        logging.warning(f"Не удалось запустить следующую сессию workflow: {e}")
 
 
 def is_local_port_open(host: str, port: int) -> bool:
@@ -98,6 +191,8 @@ def build_opener(use_proxy: Optional[str] = None) -> urllib.request.OpenerDirect
 def get_active_proxy() -> Optional[str]:
     if CUSTOM_PROXY:
         return CUSTOM_PROXY
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        return None
     for port in (2080, 10809, 10808, 7890):
         if is_local_port_open("127.0.0.1", port):
             return f"http://127.0.0.1:{port}"
@@ -454,32 +549,51 @@ def main() -> None:
 
     background_replenish("all")
 
-    max_runtime = int(os.environ.get("MAX_RUNTIME_SECONDS", "0"))
+    # В облаке GitHub Actions работаем 4 часа 50 минут (17400 сек), затем сохраняем БД и перезапускаем сессию
+    default_max = "17400" if os.environ.get("GITHUB_ACTIONS") == "true" else "0"
+    max_runtime = int(os.environ.get("MAX_RUNTIME_SECONDS", default_max))
     start_time = time.time()
+    last_sync_time = time.time()
+    interactions_since_sync = 0
 
     offset = 0
     while True:
         if max_runtime > 0 and (time.time() - start_time) >= max_runtime:
-            logging.info("Достигнут лимит времени сессии (MAX_RUNTIME_SECONDS). Сохраняем БД и перезапускаемся...")
+            logging.info("Достигнут лимит времени сессии. Сохраняем БД и запускаем новую сессию...")
+            sync_db_to_github()
+            trigger_next_github_run()
             break
         try:
             updates_resp = tg_request(
                 "getUpdates",
-                {"offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]},
-                timeout=35,
+                {"offset": offset, "timeout": 20, "allowed_updates": ["message", "callback_query"]},
+                timeout=30,
             )
             if not updates_resp.get("ok"):
                 time.sleep(3)
                 continue
 
-            for update in updates_resp.get("result", []):
+            updates = updates_resp.get("result", [])
+            for update in updates:
                 offset = update["update_id"] + 1
                 if "message" in update:
                     handle_message(update["message"])
+                    interactions_since_sync += 1
                 elif "callback_query" in update:
                     handle_callback(update["callback_query"])
+                    interactions_since_sync += 1
+
+            # Периодически сохраняем память в GitHub (каждые 15 действий или раз в 20 минут при активности)
+            if interactions_since_sync > 0 and (
+                interactions_since_sync >= 15 or (time.time() - last_sync_time) >= 1200
+            ):
+                threading.Thread(target=sync_db_to_github, daemon=True).start()
+                interactions_since_sync = 0
+                last_sync_time = time.time()
+
         except KeyboardInterrupt:
             logging.info("Бот остановлен пользователем.")
+            sync_db_to_github()
             break
         except Exception as e:
             logging.error(f"Ошибка в цикле опроса: {e}")
